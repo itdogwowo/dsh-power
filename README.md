@@ -75,30 +75,39 @@ rm -f ~/.dsh/profiles/web/node_modules/dsh-power
 | `GET /api/dsh-power/info` | 回報目前 DSH 行程的 `pid` 與完整啟動指令 |
 | `POST /api/dsh-power/action` | `{"action":"restart"}` 或 `{"action":"shutdown"}` |
 
-**Browser 半**（`lib/client.js`）在 `settings.general.item` 註冊一列，透過 `fetch` 呼叫上面兩條路由。
+**Browser 半**（`lib/client.js`）在 `settings.general.item` 註冊一列，透過 `fetch` 呼叫上面兩條路由。重啟被接受後它會切成「重新連線中」，輪詢 `/api/dsh-power/info`，直到**回報的 PID 與被取代的那個不同**才重新整理頁面——所以不會在舊 socket 將死時白刷一次，也不需要你去找新的啟動 token（瀏覽器 cookie 由 credentials 裡的密鑰簽章，壽命 30 天，跨重啟有效）。
 
-**為什麼要另開一個脫離的 helper**：這個外掛就跑在它必須殺掉的那個行程裡。若用執行階段管理的子行程，SIGTERM 觸發的 teardown 會把 helper 一起收掉，就沒有東西能把服務重新拉起來了。因此：
+**為什麼要另開一個脫離的 worker**：這個外掛就跑在它必須殺掉的那個行程裡，若用執行階段管理的子行程，DSH 退出時的清理會把 worker 一起收掉。因此 host 半用 `bash -c 'set -m; { exec node lib/restart.cjs <config>; } &'` 讓 worker 進入**獨立行程群組**，DSH 清理不到它。
 
-1. 以 `/bin/sh -c` 啟動一個 launcher，它用 `$PPID` 認出 DSH 行程；
-2. launcher 用 `perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV'` 在**新 session** 啟動 worker（沒有 `perl` 時退回 `nohup`）；
-3. worker 等 1 秒（讓 HTTP 回應先回到瀏覽器）→ `SIGTERM` → 最多等 20 秒 → 必要時 `SIGKILL`；
-4. 只有 `restart` 會繼續：從 `lsof` 取回原本的 node 執行檔與工作目錄，用**原本的指令**重新啟動，輸出附加寫入 `${DSH_HOME:-~/.dsh}/dsh-web.log`。
+**worker（`lib/restart.cjs`）以「port」而不是「pid」為準**，這是重啟可靠與否的關鍵：
+
+1. 等 1.5 秒，讓 HTTP 回應先回到瀏覽器；
+2. 對佔用該 port 的行程送 `SIGTERM`，等不到就 `SIGKILL`；**任何指令列不含 `dsh` 的佔用者一律不殺**；
+3. 確認 port 真的空出來（最多 15 秒）。若仍被非 dsh 行程佔著就**放棄並記錄**，而不是硬啟動——否則「port 有人在聽」會被誤判為啟動成功；
+4. 以 host 半在**還活著時**捕獲的 `process.execPath` + `process.argv` + `process.cwd()` 啟動新行程（不依賴 `PATH`、不從將死行程猜指令）；
+5. 驗證新行程真的在監聽（最多 30 秒），失敗就清理後重試，最多 3 次。
+
+port 由請求的 `Host` header 取得，所以在非預設埠啟動的服務也會重啟在**同一個埠**。
+
+> 重啟流程的設計參考自 [shaoyi1991/dsh-restart-web](https://github.com/shaoyi1991/dsh-restart-web)：以獨立 process group 逃離 DSH 清理、以及「殺 port」而非「殺 pid」。本外掛在其之上補了啟動驗證與重試、非 dsh 佔用者的拒絕、`shutdown`、以及自動重連。
 
 ## 安全
 
 - `shutdown` 只會送出終止訊號，不會重新啟動；要恢復必須手動啟動服務。
-- worker 在動手前會確認目標行程的指令列包含 `dsh`，否則直接退出（`exit 2`），不會誤殺其他行程。
+- worker 只會殺「自己記錄的目標」或「指令列含 `dsh`」的 port 佔用者，其餘一律拒絕並記錄。
 - `action` 只接受 `restart` 與 `shutdown` 兩個字串，其餘一律 `400`。
-- 重新啟動會沿用**原本**的啟動指令與工作目錄，不是猜測出來的新指令。
+- 重新啟動沿用**原本**的啟動指令、參數與工作目錄，不是猜測出來的新指令。
+- 日誌寫入失敗不會影響重啟（log 打不開時 worker 照常執行）。
 
 ## 疑難排解
 
 | 症狀 | 檢查 |
 | --- | --- |
 | 設定 → 通用設置 沒有那一列 | 「設定 → 外掛」的 dsh-power 開關是否被關掉；或重整頁面 |
-| 按鈕顯示「無法讀取行程資訊」 | `ps` 是否可執行（在沙箱中啟動的 DSH 會被限制），以及 `subprocess` 服務是否存在 |
+| 按鈕顯示「無法讀取行程資訊」 | `ps` 是否可執行（在沙箱中啟動的 DSH 會被限制），以及 `subprocess` 服務是否存在。重啟本身不依賴 `ps` |
 | 關閉後回不來 | 這是預期行為；請手動啟動服務，或改用「重新啟動」 |
-| 重新啟動後沒回來 | 看 `${DSH_HOME:-~/.dsh}/dsh-web.log` |
+| 重新啟動後頁面沒回來 | 看 `${DSH_HOME:-~/.dsh}/dsh-web.log`：`dsh-power:` 開頭是 worker 的紀錄，`dsh web: http://…` 是新行程的啟動輸出 |
+| worker 記錄 `aborting: port … is still held` | 該埠被非 dsh 行程佔用，外掛刻意不殺它；請自行處理佔用者 |
 
 ## 授權
 
