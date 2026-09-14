@@ -266,7 +266,7 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
   render()
   await new Promise((resolve) => setTimeout(resolve, 5))
   check('session probe asks the app root', calls2.includes('/'))
-  check('unauthenticated page warns about the address', textOf(root_node).includes('cookie 只對啟動時列印的網址有效'), JSON.stringify(textOf(root_node)))
+  check('unauthenticated page warns about the address', textOf(root_node).includes('沒有有效登入') && textOf(root_node).includes('?token='), JSON.stringify(textOf(root_node)))
   check('unauthenticated page locks the actions', buttonWithText('重新啟動')?.props?.disabled === true)
 }
 
