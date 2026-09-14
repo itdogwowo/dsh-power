@@ -1,0 +1,37 @@
+{
+  "name": "dsh-power",
+  "version": "1.0.0",
+  "description": "DSH Web 設定 → 通用設置 的服務電源列：一鍵重新啟動／關閉整個 DSH 行程，可在設定 → 外掛 獨立開關。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.5-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "restart",
+    "shutdown"
+  ],
+  "license": "MIT"
+}

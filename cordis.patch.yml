@@ -1,0 +1,16 @@
+# dsh-power — bundle patch.
+#
+# This file IS the plugin's composition contribution: the profile lists this
+# package in `dsh.profile.bundles`, and the loader applies this layer, which
+# mounts the package's own host half by name.
+#
+# `id` (dsh-power) is what Settings → 外掛 switches: the plugin manager reads
+# this file from the installed package to map the package to its row, then
+# writes `disabled:` onto a matching override in the profile's own patch layer.
+#
+# The row name must stay equal to the package name: the loader and the plugin
+# manager both resolve the entry by it, and an enable/disable override whose
+# name mismatches the inserted entry is skipped.
+- insert:
+    - id: dsh-power
+      name: dsh-power
