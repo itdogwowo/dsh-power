@@ -77,6 +77,7 @@ check('worker log failure is non-fatal', workerSource.includes('cannot open log 
 // --- browser half ---------------------------------------------------------
 const calls = []
 let loaded = null
+let loadedUnauth = null
 let reloaded = false
 let replaced = null
 let acted = false
@@ -104,6 +105,7 @@ const sandbox = {
   },
   fetch: async (url, options) => {
     calls.push({ url, options })
+    if (url === '/') return { status: 200, json: async () => ({}) }
     if (url.includes('/info')) {
       const pid = acted ? '55555' : '67489'
       return { json: async () => ({ ok: true, pid, port: 3080, command: 'node /x/dsh web' }) }
@@ -220,6 +222,53 @@ check('no navigation before the new pid answers', replaced === null && reloaded 
 
 await new Promise((resolve) => setTimeout(resolve, 1800))
 check('left for a clean URL after the new pid answered', replaced === 'http://127.0.0.1:3080/', String(replaced))
+
+// --- second scenario: an unauthenticated page -----------------------------
+{
+  const calls2 = []
+  const sandbox2 = {
+    setTimeout,
+    clearTimeout,
+    window: {
+      __ModuleLoader__: { load: (definition) => { loadedUnauth = definition } },
+      location: { origin: 'http://localhost:3080', reload: () => {}, replace: () => {} },
+      document: { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} },
+    },
+    document: {
+      createElement: () => ({ dataset: {}, textContent: '', remove() {} }),
+      head: { appendChild: () => {} },
+    },
+    fetch: async (url) => {
+      calls2.push(url)
+      if (url === '/') return { status: 401, json: async () => ({}) }
+      return { json: async () => ({ ok: true, pid: '67489', port: 3080, command: 'node /x/dsh web' }) }
+    },
+    console,
+  }
+  vm.createContext(sandbox2)
+  vm.runInContext(readFileSync(join(root, 'lib/client.js'), 'utf8'), sandbox2, { filename: 'client.js' })
+  const mod2 = loadedUnauth.factory((id) => {
+    if (id === 'react') return ReactMock
+    throw new Error('unexpected require: ' + id)
+  })
+  const regs2 = []
+  mod2.apply({
+    effect: (fn) => fn(),
+    slots: {
+      inject: (key, callback) => { regs2.key = key; callback() },
+      register: (options, component) => regs2.push({ options, component }),
+    },
+  })
+  Component = regs2[0].component
+  cursor = 0
+  hooks.length = 0
+  effectState.length = 0
+  render()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  check('session probe asks the app root', calls2.includes('/'))
+  check('unauthenticated page warns about the address', textOf(root_node).includes('cookie 只對啟動時列印的網址有效'), JSON.stringify(textOf(root_node)))
+  check('unauthenticated page locks the actions', buttonWithText('重新啟動')?.props?.disabled === true)
+}
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
