@@ -59,6 +59,7 @@ check('host expands DSH_HOME', hostSource.includes('function dshHomeOf'))
 check('host spawns the worker in its own group', hostSource.includes('set -m'))
 check('host logs acceptance', hostSource.includes("note('host accepted"))
 check('host reads the port from Host', hostSource.includes('function portOf'))
+check('restart never opens a browser tab', hostSource.includes('withoutBrowserOpen'))
 
 // --- restart worker -------------------------------------------------------
 const workerSource = readFileSync(join(root, 'lib/restart.cjs'), 'utf8')

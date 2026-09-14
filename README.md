@@ -87,7 +87,7 @@ rm -f ~/.dsh/profiles/web/node_modules/dsh-power
 4. 以 host 半在**還活著時**捕獲的 `process.execPath` + `process.argv` + `process.cwd()` 啟動新行程（不依賴 `PATH`、不從將死行程猜指令）；
 5. 驗證新行程真的在監聽（最多 30 秒），失敗就清理後重試，最多 3 次。
 
-port 由請求的 `Host` header 取得，所以在非預設埠啟動的服務也會重啟在**同一個埠**。
+port 由請求的 `Host` header 取得，所以在非預設埠啟動的服務也會重啟在**同一個埠**。新行程一律加上 `--no-open`：`dsh web` 預設會開啟一個瀏覽器分頁，若照原樣重啟，每重啟一次就多一個分頁；而那些分頁各自認證在開啟它的那個行程上，下一次重啟後就會停在「請重新連接」，看起來像服務壞了。使用者手上的頁面本來就會自己重連，不需要再開新分頁。
 
 > 重啟流程的設計參考自 [shaoyi1991/dsh-restart-web](https://github.com/shaoyi1991/dsh-restart-web)：以獨立 process group 逃離 DSH 清理、以及「殺 port」而非「殺 pid」。本外掛在其之上補了啟動驗證與重試、非 dsh 佔用者的拒絕、`shutdown`、以及自動重連。
 
