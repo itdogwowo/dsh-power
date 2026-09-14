@@ -108,6 +108,31 @@ port 由請求的 `Host` header 取得，所以在非預設埠啟動的服務也
 | 關閉後回不來 | 這是預期行為；請手動啟動服務，或改用「重新啟動」 |
 | 重新啟動後頁面沒回來 | 看 `${DSH_HOME:-~/.dsh}/dsh-web.log`：`dsh-power:` 開頭是 worker 的紀錄，`dsh web: http://…` 是新行程的啟動輸出 |
 | worker 記錄 `aborting: port … is still held` | 該埠被非 dsh 行程佔用，外掛刻意不殺它；請自行處理佔用者 |
+| 那一列說「瀏覽器回報離線」但系統明明有網路 | 瀏覽器的 `navigator.onLine` 卡住了（DSH 在離線時會暫停重連）。外掛會在本地服務有回應時自動覆寫它；若覆寫失敗，重啟瀏覽器 |
+
+## 致謝
+
+這個外掛能收斂到現在的樣子，靠的是別人的程式碼與觀察。實際的貢獻如下：
+
+**設計起點：[shaoyi1991/dsh-restart-web](https://github.com/shaoyi1991/dsh-restart-web)**
+重啟流程的兩個關鍵想法來自這裡——以獨立 process group 逃離 DSH 的退出清理（`set -m`）、以及「殺 port 而非殺 pid」。本外掛保留這兩點，並在其上補了啟動驗證與重試、非 dsh 佔用者的拒絕、`shutdown`、前端自動重連，以及不分頁的重新啟動。
+
+**DSH 自身的套件**（作為行為依據與介面來源，非程式碼引用）：
+
+- `@deepseek-ai/dsh-client-connection` — cookie 綁定 authority（`cookieName`）、簽章密鑰存於 credentials（30 天，跨重啟有效）、以及「offline 時暫停自動重連」的 `setNetworkAvailable`。最後一項是這個外掛之所以需要修離線旗標的原因。
+- `@deepseek-ai/dsh-client-ui-settings-general` — `settings.general.item` 那列的樣式（`rowText` / `title` / `desc` / `selector` 的字級、間距、token）是照它對齊的；它同時也是「連接異常，點擊立即重連」指示器的出處，把症狀定位到連線層。
+- `@deepseek-ai/dsh-client-modules` — `dsh.client` 與 `exports["./client"]` 的載入契約、`nearestPackage` 的解析規則，以及 browser bundle 必須以 `window.__ModuleLoader__.load({ id, factory })` 註冊。
+- `@deepseek-ai/dsh-host-webserver` — `webServer.register` 的路由語意（exact 路由先於 `/api` prefix 命中）。
+- `@deepseek-ai/dsh-cordis-host-runner` — 動態外掛的沙盒形狀（`ctx` 只在 `apply` 內、`process` 不可用），這決定了本外掛後來改寫成真正的 profile bundle 而非動態外掛。
+
+**社群外掛包 `dsh-web` / `@linxin666/*`**
+外掛管理器如何讀寫 profile 的 patch 層、如何以 row id 將套件對應到可切換的列並寫入 `disabled` 覆寫，是照它的實作推導出來的；它的 bundle-guard 註解（「同時以 bundle 與 patch row 掛載會在下一次開機死於重複路由」）讓我們避開了那個地雷。
+
+**Atlassian SourceTree**
+本外掛的 commit 是透過它隨附的憑證仲介 `/Applications/SourceTree.app/Contents/Resources/bin/git-credential-sourcetree` 推送的——由它出面提供憑證，而不是去讀它的 keychain。
+
+**使用者的第一手觀察**
+這個外掛的每一次修正都源自實際使用回報：重啟後按鈕失效、第二次重啟回到舊症狀、`Cmd+R` 多出「連接異常」、以及**「不斷重啟會不斷新增分頁」**——最後這一項直接促成了 `--no-open`，也解釋了先前反覆出現的「不穩定」。
 
 ## 授權
 
