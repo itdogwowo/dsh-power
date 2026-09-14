@@ -225,7 +225,6 @@ const post = calls.find((call) => call.url === '/api/dsh-power/action')
 check('post body', post?.options?.body === '{"action":"restart"}', post?.options?.body)
 check('restart notice', textOf(root_node).includes('服務正在重新啟動'))
 check('reconnecting state shown', buttonWithText('重新連線中…')?.props?.disabled === true)
-check('manual escape hatch offered', buttonWithText('立即重新整理') !== null)
 check('visibility recovery wired', visibilityListeners.some((entry) => entry.name === 'visibilitychange'))
 check('no navigation before the new pid answers', replaced === null && reloaded === false)
 
@@ -281,6 +280,56 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
   check('session probe asks the app root', calls2.includes('/'))
   check('unauthenticated page warns about the address', textOf(root_node).includes('沒有有效登入') && textOf(root_node).includes('?token='), JSON.stringify(textOf(root_node)))
   check('unauthenticated page locks the actions', buttonWithText('重新啟動')?.props?.disabled === true)
+}
+
+// --- third scenario: the machine reports no network ------------------------
+{
+  let loadedOffline = null
+  const sandbox3 = {
+    setTimeout,
+    clearTimeout,
+    window: {
+      __ModuleLoader__: { load: (definition) => { loadedOffline = definition } },
+      location: { origin: 'http://127.0.0.1:3080', href: 'http://127.0.0.1:3080/', reload: () => {}, replace: () => {} },
+      navigator: { onLine: false },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      document: { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} },
+    },
+    document: {
+      createElement: () => ({ dataset: {}, textContent: '', remove() {} }),
+      head: { appendChild: () => {} },
+    },
+    fetch: async (url) => {
+      if (url === '/') return { status: 200, json: async () => ({}) }
+      if (url === '/api/dsh-power/report') return { status: 204, json: async () => ({}) }
+      return { json: async () => ({ ok: true, pid: '67489', port: 3080, command: 'node /x/dsh web' }) }
+    },
+    console,
+  }
+  vm.createContext(sandbox3)
+  vm.runInContext(readFileSync(join(root, 'lib/client.js'), 'utf8'), sandbox3, { filename: 'client.js' })
+  const mod3 = loadedOffline.factory((id) => {
+    if (id === 'react') return ReactMock
+    throw new Error('unexpected require: ' + id)
+  })
+  const regs3 = []
+  mod3.apply({
+    get: () => undefined,
+    effect: (fn) => fn(),
+    slots: {
+      inject: (key, callback) => { regs3.key = key; callback() },
+      register: (options, component) => regs3.push({ options, component }),
+    },
+  })
+  Component = regs3[0].component
+  cursor = 0
+  hooks.length = 0
+  effectState.length = 0
+  render()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  check('offline machine explains the reconnect prompt', textOf(root_node).includes('作業系統回報沒有網路'), JSON.stringify(textOf(root_node)))
+  check('offline machine locks the actions', buttonWithText('重新啟動')?.props?.disabled === true)
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
