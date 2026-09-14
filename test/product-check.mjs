@@ -285,6 +285,7 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
 // --- third scenario: the machine reports no network ------------------------
 {
   let loadedOffline = null
+  const dispatched = []
   const sandbox3 = {
     setTimeout,
     clearTimeout,
@@ -292,6 +293,8 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
       __ModuleLoader__: { load: (definition) => { loadedOffline = definition } },
       location: { origin: 'http://127.0.0.1:3080', href: 'http://127.0.0.1:3080/', reload: () => {}, replace: () => {} },
       navigator: { onLine: false },
+      Event: class { constructor(type) { this.type = type } },
+      dispatchEvent: (event) => { dispatched.push(event && event.type) },
       addEventListener: () => {},
       removeEventListener: () => {},
       document: { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} },
@@ -328,8 +331,62 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
   effectState.length = 0
   render()
   await new Promise((resolve) => setTimeout(resolve, 5))
-  check('offline machine explains the reconnect prompt', textOf(root_node).includes('作業系統回報沒有網路'), JSON.stringify(textOf(root_node)))
-  check('offline machine locks the actions', buttonWithText('重新啟動')?.props?.disabled === true)
+  check('stale offline flag repaired once the service answered', sandbox3.window.navigator.onLine === true)
+  check('online event dispatched to the app', dispatched.includes('online'), dispatched.join(','))
+  check('repaired page drops the offline hint', !textOf(root_node).includes('瀏覽器回報離線'), JSON.stringify(textOf(root_node)))
+  check('repaired page leaves the actions usable', buttonWithText('重新啟動')?.props?.disabled === false)
+}
+
+// --- fourth scenario: a browser that refuses the override ------------------
+{
+  let loadedFrozen = null
+  const sandbox4 = {
+    setTimeout,
+    clearTimeout,
+    window: {
+      __ModuleLoader__: { load: (definition) => { loadedFrozen = definition } },
+      location: { origin: 'http://127.0.0.1:3080', href: 'http://127.0.0.1:3080/', reload: () => {}, replace: () => {} },
+      navigator: Object.freeze({ onLine: false }),
+      Event: class { constructor(type) { this.type = type } },
+      dispatchEvent: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      document: { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} },
+    },
+    document: {
+      createElement: () => ({ dataset: {}, textContent: '', remove() {} }),
+      head: { appendChild: () => {} },
+    },
+    fetch: async (url) => {
+      if (url === '/') return { status: 200, json: async () => ({}) }
+      if (url === '/api/dsh-power/report') return { status: 204, json: async () => ({}) }
+      return { json: async () => ({ ok: true, pid: '67489', port: 3080, command: 'node /x/dsh web' }) }
+    },
+    console,
+  }
+  vm.createContext(sandbox4)
+  vm.runInContext(readFileSync(join(root, 'lib/client.js'), 'utf8'), sandbox4, { filename: 'client.js' })
+  const mod4 = loadedFrozen.factory((id) => {
+    if (id === 'react') return ReactMock
+    throw new Error('unexpected require: ' + id)
+  })
+  const regs4 = []
+  mod4.apply({
+    get: () => undefined,
+    effect: (fn) => fn(),
+    slots: {
+      inject: (key, callback) => { regs4.key = key; callback() },
+      register: (options, component) => regs4.push({ options, component }),
+    },
+  })
+  Component = regs4[0].component
+  cursor = 0
+  hooks.length = 0
+  effectState.length = 0
+  render()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  check('unrepairable offline flag keeps the hint', textOf(root_node).includes('瀏覽器回報離線'), JSON.stringify(textOf(root_node)))
+  check('unrepairable offline flag locks the actions', buttonWithText('重新啟動')?.props?.disabled === true)
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
