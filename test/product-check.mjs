@@ -83,6 +83,7 @@ let replaced = null
 let acted = false
 const styleTags = []
 const visibilityListeners = []
+const windowListeners = []
 const sandbox = {
   setTimeout,
   clearTimeout,
@@ -90,9 +91,13 @@ const sandbox = {
     __ModuleLoader__: { load: (definition) => { loaded = definition } },
     location: {
       origin: 'http://127.0.0.1:3080',
+      href: 'http://127.0.0.1:3080/',
       reload: () => { reloaded = true },
       replace: (url) => { replaced = url },
     },
+    navigator: { onLine: true },
+    addEventListener: (name, handler) => windowListeners.push({ name, handler }),
+    removeEventListener: () => {},
     document: {
       visibilityState: 'visible',
       addEventListener: (name, handler) => visibilityListeners.push({ name, handler }),
@@ -106,6 +111,7 @@ const sandbox = {
   fetch: async (url, options) => {
     calls.push({ url, options })
     if (url === '/') return { status: 200, json: async () => ({}) }
+    if (url === '/api/dsh-power/report') return { status: 204, json: async () => ({}) }
     if (url.includes('/info')) {
       const pid = acted ? '55555' : '67489'
       return { json: async () => ({ ok: true, pid, port: 3080, command: 'node /x/dsh web' }) }
@@ -159,6 +165,7 @@ check('browser injects slots', Array.isArray(mod.inject) && mod.inject.includes(
 
 const registrations = []
 mod.apply({
+  get: () => undefined,
   effect: (fn) => fn(),
   slots: {
     inject: (key, callback) => { registrations.key = key; callback() },
@@ -168,6 +175,8 @@ mod.apply({
 check('registers into settings.general.item', registrations.key === 'settings.general.item', registrations.key)
 check('row id', registrations[0]?.options?.id === 'service-power', registrations[0]?.options?.id)
 check('row order', registrations[0]?.options?.order === 30, String(registrations[0]?.options?.order))
+check('browser reports to its host half', calls.some((call) => call.url === '/api/dsh-power/report' && String(call.options?.body).includes('mount')))
+check('error reporting wired', windowListeners.some((entry) => entry.name === 'error') && windowListeners.some((entry) => entry.name === 'unhandledrejection'))
 check('style tag inserted', styleTags.length === 1)
 Component = registrations[0].component
 
@@ -231,7 +240,10 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
     clearTimeout,
     window: {
       __ModuleLoader__: { load: (definition) => { loadedUnauth = definition } },
-      location: { origin: 'http://localhost:3080', reload: () => {}, replace: () => {} },
+      location: { origin: 'http://localhost:3080', href: 'http://localhost:3080/', reload: () => {}, replace: () => {} },
+      navigator: { onLine: true },
+      addEventListener: () => {},
+      removeEventListener: () => {},
       document: { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} },
     },
     document: {
@@ -253,6 +265,7 @@ check('left for a clean URL after the new pid answered', replaced === 'http://12
   })
   const regs2 = []
   mod2.apply({
+    get: () => undefined,
     effect: (fn) => fn(),
     slots: {
       inject: (key, callback) => { regs2.key = key; callback() },

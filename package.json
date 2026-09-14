@@ -1,6 +1,6 @@
 {
   "name": "dsh-power",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "DSH Web 設定 → 通用設置 的服務電源列：一鍵重新啟動／關閉整個 DSH 行程，可在設定 → 外掛 獨立開關。",
   "type": "module",
   "main": "lib/index.js",
