@@ -1,13 +1,16 @@
 {
   "name": "dsh-power",
-  "version": "1.7.2",
-  "description": "DSH Web 設定 → 通用設置 的服務電源列：一鍵重新啟動／關閉整個 DSH 行程，可在設定 → 外掛 獨立開關。",
+  "version": "1.8.0",
+  "description": "DSH Web 設定 → 通用設置 的服務電源列：一鍵重新啟動／關閉整個 DSH 行程，可在設定 → 外掛 獨立開關。macOS / Linux / Windows。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node test/product-check.mjs && node test/worker-check.mjs"
   },
   "files": [
     "lib",

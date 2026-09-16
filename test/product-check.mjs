@@ -8,7 +8,8 @@
  * Usage: node test/product-check.mjs [package dir]
  */
 import vm from 'node:vm'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
@@ -60,6 +61,10 @@ check('host spawns the worker in its own group', hostSource.includes('set -m'))
 check('host logs acceptance', hostSource.includes("note('host accepted"))
 check('host reads the port from Host', hostSource.includes('function portOf'))
 check('restart never opens a browser tab', hostSource.includes('withoutBrowserOpen'))
+check('host replays node flags', hostSource.includes('process.execArgv'))
+check('host does not replay the inspector', hostSource.includes('DEBUGGER_FLAG'))
+check('host reads the home directory on Windows too', hostSource.includes('USERPROFILE'))
+check('host knows the pid without a shell probe', hostSource.includes('String(process.pid)'))
 
 // --- restart worker -------------------------------------------------------
 const workerSource = readFileSync(join(root, 'lib/restart.cjs'), 'utf8')
@@ -70,10 +75,235 @@ check('worker parses', (() => {
   }
 })())
 check('worker reads its config from argv', workerSource.includes('Buffer.from(process.argv[2]'))
-check('worker treats the port as authority', workerSource.includes('listenersOf(port)'))
+check('worker treats the port as authority', workerSource.includes('listenersOnPort()'))
 check('worker verifies the relaunch', workerSource.includes('waitPortUp'))
-check('worker refuses non-dsh holders', workerSource.includes("command.includes('dsh')"))
+check('worker refuses non-dsh holders', workerSource.includes('isDshCommand(command)'))
 check('worker log failure is non-fatal', workerSource.includes('cannot open log file'))
+check('worker cross-checks the port over TCP', workerSource.includes('tcpAnswers'))
+check('worker hides its relaunch window on Windows', workerSource.includes('windowsHide: true'))
+check('worker delegates platform questions', workerSource.includes("require('./platform.cjs')"))
+
+// --- host half: the Windows spawn branch ----------------------------------
+// The worker cannot be started through the harness subprocess service on
+// Windows (its children live in a Job Object with KILL_ON_JOB_CLOSE and would
+// die with the service), so the host spawns it detached instead.
+const windowsBranch = hostSource.slice(hostSource.indexOf('const startWorker'), hostSource.indexOf("const inner = ['set -m'"))
+check('windows worker is spawned outside the harness job', windowsBranch.includes('detached: true') && windowsBranch.includes('windowsHide: true'))
+check('windows worker is not spawned through subprocess', !windowsBranch.includes('spawnDetached('))
+check('windows worker keeps the service log', windowsBranch.includes('openSync(logPath'))
+check('windows worker starts outside the project directory', windowsBranch.includes('cwd: tmpdir()'))
+check('windows asks the harness to exit gracefully', hostSource.includes("ctx.get('appExit')"))
+check('graceful exit waits for the response', hostSource.includes("res.once('finish'"))
+check('windows gets the longer grace period', hostSource.includes('graceMs: IS_WINDOWS ? 2500 : 1500'))
+
+// --- platform primitives --------------------------------------------------
+const platformLib = require(join(root, 'lib/platform.cjs'))
+const PORT = 3080
+
+// netstat as Windows prints it: the state word is localized (偵聽 = listening)
+// and the header is localized too, so only the columns are reliable.
+const netstatSample = [
+  '',
+  '活動連線',
+  '',
+  '  通訊協定  本機位址          外部位址              狀態          PID',
+  '  TCP    0.0.0.0:135            0.0.0.0:0             偵聽          1004',
+  '  TCP    127.0.0.1:3080         0.0.0.0:0             偵聽          4242',
+  '  TCP    127.0.0.1:3080         127.0.0.1:51515       TIME_WAIT     0',
+  '  TCP    127.0.0.1:3080         127.0.0.1:51516       已建立        5555',
+  '  TCP    [::]:3080              [::]:0                偵聽          4242',
+  '  TCP    127.0.0.1:30800        0.0.0.0:0             偵聽          9999',
+  '  TCP    0.0.0.0:8080           0.0.0.0:0             偵聽          7777',
+  '',
+].join('\r\n')
+const netstatPids = platformLib.parseWindowsNetstat(netstatSample, PORT)
+check('netstat: reading is by column, not by language', JSON.stringify(netstatPids) === '["4242"]', JSON.stringify(netstatPids))
+check('netstat: a time-wait row is not a listener', !netstatPids.includes('0'))
+check('netstat: a connected row is not a listener', !netstatPids.includes('5555'))
+check('netstat: a longer port is not this port', !netstatPids.includes('9999'))
+check('netstat: an English listing still parses', JSON.stringify(platformLib.parseWindowsNetstat(
+  '  TCP    0.0.0.0:3080    0.0.0.0:0    LISTENING    4242\r\n', PORT,
+)) === '["4242"]')
+
+const psArgs = platformLib.powerShellArgs('Get-Date')
+check('powershell: script is base64/UTF-16LE, not shell-quoted',
+  psArgs.includes('-EncodedCommand') && psArgs.includes('-NoProfile') && Buffer.from(psArgs[psArgs.length - 1], 'base64').toString('utf16le') === 'Get-Date')
+check('powershell: listener script carries the port', platformLib.listenersScript(PORT).includes('-LocalPort 3080'))
+check('powershell: command-line script carries the pid', platformLib.commandLineScript('4242').includes('ProcessId=4242'))
+check('powershell: listener script asks for the listening state', platformLib.listenersScript(PORT).includes('-State Listen'))
+
+const execCalls = []
+const fakeExec = (answers) => async (file, args) => {
+  execCalls.push({ file, args })
+  const answer = answers(file, args)
+  if (answer === undefined) throw new Error('not available: ' + file)
+  return answer
+}
+
+// Windows: PowerShell first, netstat when it is refused.
+{
+  execCalls.length = 0
+  const pids = await platformLib.listenersOf({
+    platform: 'win32',
+    port: PORT,
+    exec: fakeExec((file) => (file.includes('powershell') ? '4242\r\n4242\r\n' : undefined)),
+  })
+  check('windows: listeners come from PowerShell', JSON.stringify(pids) === '["4242"]' && execCalls[0].file.includes('powershell'), JSON.stringify(pids))
+}
+{
+  execCalls.length = 0
+  const pids = await platformLib.listenersOf({
+    platform: 'win32',
+    port: PORT,
+    exec: fakeExec((file, args) => (file.includes('netstat') ? netstatSample : undefined)),
+  })
+  check('windows: netstat answers when PowerShell is blocked',
+    JSON.stringify(pids) === '["4242"]' && execCalls.length === 2 && execCalls[1].file.includes('netstat') && execCalls[1].args.join(' ') === '-ano -p TCP',
+    JSON.stringify(pids))
+}
+{
+  const pids = await platformLib.listenersOf({ platform: 'win32', port: PORT, exec: fakeExec(() => undefined) })
+  check('windows: a denied probe reports no listeners', pids.length === 0)
+}
+{
+  execCalls.length = 0
+  const pids = await platformLib.listenersOf({ platform: 'darwin', port: PORT, exec: fakeExec(() => '4242\n') })
+  check('posix: listeners come from lsof', JSON.stringify(pids) === '["4242"]' && execCalls[0].file === 'lsof' && execCalls[0].args.includes('tcp:3080'), JSON.stringify(execCalls[0]))
+}
+
+// Windows command lines: CIM first, wmic when PowerShell is refused.
+{
+  execCalls.length = 0
+  const command = await platformLib.commandOf({
+    platform: 'win32',
+    pid: '4242',
+    exec: fakeExec((file) => (file.includes('powershell') ? '  "C:\\Program Files\\nodejs\\node.exe" C:\\dev\\dsh\\lib\\bin.js web  \r\n' : undefined)),
+  })
+  check('windows: command line comes from CIM', command === '"C:\\Program Files\\nodejs\\node.exe" C:\\dev\\dsh\\lib\\bin.js web', command)
+  check('windows: the CIM probe is asked for that pid', Buffer.from(execCalls[0].args[execCalls[0].args.length - 1], 'base64').toString('utf16le').includes('ProcessId=4242'))
+}
+{
+  execCalls.length = 0
+  const command = await platformLib.commandOf({
+    platform: 'win32',
+    pid: '4242',
+    exec: fakeExec((file) => (file.includes('wmic')
+      ? 'CommandLine\r\n"C:\\Program Files\\nodejs\\node.exe" C:\\dev\\dsh\r\n\\lib\\bin.js web\r\n\r\n'
+      : undefined)),
+  })
+  check('windows: wmic answers when PowerShell is blocked', command === '"C:\\Program Files\\nodejs\\node.exe" C:\\dev\\dsh \\lib\\bin.js web', command)
+  check('windows: the wmic probe asks for that pid', execCalls[1].args.join(' ') === 'process where processid=4242 get commandline', execCalls[1].args.join(' '))
+}
+check('wmic: a missing process is not a command line', platformLib.parseWmicCommandLine('No Instance(s) Available.\r\n') === '')
+{
+  const command = await platformLib.commandOf({ platform: 'darwin', pid: '4242', exec: fakeExec(() => '/usr/local/bin/node /usr/local/bin/dsh web\n') })
+  check('posix: command line comes from ps', command === '/usr/local/bin/node /usr/local/bin/dsh web', command)
+}
+
+check('a Windows dsh path is ours, in any case',
+  platformLib.isDshCommand('"C:\\Program Files\\nodejs\\node.exe" C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\DSH\\lib\\bin.js web')
+  && platformLib.isDshCommand('node C:\\dev\\deepseek-harness\\apps\\cli\\lib\\bin.js web'))
+check('an unrelated server is not ours', platformLib.isDshCommand('nginx: worker process') === false)
+check('an unreadable command line is not ours', platformLib.isDshCommand('') === false)
+check('node flags are replays except the inspector',
+  JSON.stringify(host.withoutDebugger(['--inspect-brk', '--max-old-space-size=4096', '--import', 'tsx', '--debug=9229']))
+  === '["--max-old-space-size=4096","--import","tsx"]',
+  JSON.stringify(host.withoutDebugger(['--inspect-brk', '--max-old-space-size=4096', '--import', 'tsx', '--debug=9229'])))
+
+// --- host half: driven through a fake context -----------------------------
+// The Windows branch above is checked statically (no Windows here to run it);
+// everything platform-neutral is exercised for real, including the config the
+// worker receives.
+{
+  const home = mkdtempSync(join(tmpdir(), 'dsh-power-check-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const routes = new Map()
+  const spawned = []
+  const fakeCtx = {
+    logger: { info: () => {} },
+    effect: (fn) => { fn(); return () => {} },
+    get: (name) => (name === 'subprocess'
+      ? { spawn: (spec) => { spawned.push(spec); return { done: Promise.resolve() } } }
+      : undefined),
+    webServer: { register: (route) => { routes.set(route.path, route); return () => {} } },
+  }
+  try {
+    host.apply(fakeCtx)
+    check('host registers info, action and report routes', routes.size === 3, [...routes.keys()].join(','))
+
+    const call = (path, method, hostHeader, body) => new Promise((resolve) => {
+      const listeners = {}
+      const req = {
+        method,
+        headers: { host: hostHeader },
+        on: (name, handler) => { listeners[name] = handler },
+        destroy: () => {},
+      }
+      const res = {
+        statusCode: 0,
+        body: '',
+        headers: {},
+        onFinish: null,
+        setHeader: (name, value) => { res.headers[name] = value },
+        once: (name, handler) => { if (name === 'finish') res.onFinish = handler },
+        end: (text) => {
+          res.body = String(text ?? '')
+          if (res.onFinish) res.onFinish()
+          resolve(res)
+        },
+      }
+      // The handler attaches its request listeners synchronously, before it
+      // awaits the body — so the body can be delivered right away.
+      const settled = Promise.resolve(routes.get(path).handler(req, res))
+      if (body !== undefined) listeners.data?.(body)
+      listeners.end?.()
+      settled.then(() => resolve(res), () => resolve(res))
+    })
+
+    const info = await call('/api/dsh-power/info', 'GET', '127.0.0.1:3080')
+    const infoBody = JSON.parse(info.body)
+    check('info: reports this process', infoBody.ok === true && infoBody.pid === String(process.pid), JSON.stringify(infoBody))
+    check('info: reports the port from Host', infoBody.port === 3080, String(infoBody.port))
+    check('info: reports a usable command line', typeof infoBody.command === 'string' && infoBody.command.length > 0, infoBody.command)
+    check('info: reports the log path', infoBody.logPath === join(home, 'dsh-web.log'), infoBody.logPath)
+
+    const defaultPort = await call('/api/dsh-power/info', 'GET', 'localhost')
+    check('info: a Host without a port reads as the HTTP default', JSON.parse(defaultPort.body).port === 80, defaultPort.body)
+
+    const action = await call('/api/dsh-power/action', 'POST', '127.0.0.1:3080', JSON.stringify({ action: 'restart' }))
+    const actionBody = JSON.parse(action.body)
+    check('action: accepted', action.statusCode === 200 && actionBody.ok === true, action.body)
+    check('action: answers with the replaced pid', actionBody.pid === String(process.pid))
+    check('action: spawned exactly one worker', spawned.length === 1)
+    const argv = spawned[0]?.argv ?? []
+    check('action: worker runs the shipped script', argv.some((value) => String(value).includes('restart.cjs')))
+    check('action: worker is detached from the group DSH cleans', argv[0] === 'bash' && argv[2].includes('set -m'), argv.slice(0, 2).join(' '))
+    // The payload is the last single-quoted word of the generated shell script.
+    const quoted = [...String(argv[2] ?? '').matchAll(/'([^']*)'/g)].map((match) => match[1])
+    const payload = quoted[quoted.length - 1]
+    const workerConfig = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+    check('action: worker config names the port and host', workerConfig.port === 3080 && workerConfig.host === '127.0.0.1', JSON.stringify({ port: workerConfig.port, host: workerConfig.host }))
+    check('action: worker config names this pid', workerConfig.pid === String(process.pid))
+    check('action: relaunch never opens a browser', workerConfig.args.includes('--no-open'), JSON.stringify(workerConfig.args))
+    check('action: relaunch keeps the captured entry point', workerConfig.nodeBin === process.execPath && workerConfig.dshBin === process.argv[1], workerConfig.dshBin)
+    check('action: relaunch runs in the captured cwd', workerConfig.cwd === process.cwd(), workerConfig.cwd)
+    check('action: the log lives in DSH_HOME', workerConfig.logFile === join(home, 'dsh-web.log'), workerConfig.logFile)
+    check('action: the recorded action is in the log',
+      readFileSync(join(home, 'dsh-web.log'), 'utf8').includes('host accepted restart port=3080'),
+      readFileSync(join(home, 'dsh-web.log'), 'utf8').trim().split('\n').pop())
+
+    const bad = await call('/api/dsh-power/action', 'POST', '127.0.0.1:3080', JSON.stringify({ action: 'explode' }))
+    check('action: unknown actions are refused', bad.statusCode === 400, bad.body)
+    const impossiblePort = await call('/api/dsh-power/action', 'POST', '127.0.0.1:99999', JSON.stringify({ action: 'shutdown' }))
+    check('action: an impossible port is refused', impossiblePort.statusCode === 500, impossiblePort.body)
+    check('action: no worker was spawned for a refused request', spawned.length === 1)
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+}
 
 // --- browser half ---------------------------------------------------------
 const calls = []
