@@ -64,11 +64,13 @@ rm -f ~/.dsh/profiles/web/node_modules/dsh-power
 
 ## 需求
 
-- **macOS**：實測平台（`lsof` 找埠的佔用者、`ps` 讀指令列，`bash` 的 `set -m` 讓 worker 脫離 DSH 的清理）。
+- **macOS**：原始實測平台（`lsof` 找埠的佔用者、`ps` 讀指令列，`bash` 的 `set -m` 讓 worker 脫離 DSH 的清理）。此後改動過的路徑（例如埠的來源）尚未在 macOS 實機上重跑。
 - **Linux**：同一組工具，未實測。
-- **Windows 10/11**：支援。埠的佔用者以 PowerShell（內建 5.1+）的 `Get-NetTCPConnection` 讀取、`netstat` 為後備；行程指令列以 `Get-CimInstance` 讀取、`wmic` 為後備；worker 以 `child_process.spawn(..., { detached: true })` 啟動（見〈Windows 上的差異〉）。**這條路徑有單元測試覆蓋，但尚未在 Windows 實機上跑過。**
+- **Windows 10/11**：支援，且**已在 Windows 實機上驗證**。埠的佔用者以 PowerShell（內建 5.1+）的 `Get-NetTCPConnection` 讀取、`netstat` 為後備；行程指令列以 `Get-CimInstance` 讀取、`wmic` 為後備；worker 以 `child_process.spawn(..., { detached: true })` 啟動（見〈Windows 上的差異〉）。
 - DSH `>= 0.1.5-rc.1`。
 - POSIX 上一定要有 `subprocess` 服務（`@deepseek-ai/dsh-base` 已提供），worker 才起得來；沒有時重啟／關閉會回報「此環境沒有 subprocess 服務」。Windows 不需要它。
+
+> **已知的機器相依性**：`Get-NetTCPConnection` 依賴 `ROOT/StandardCimv2` 的 `MSFT_NetTCPConnection` CIM 類別。該類別若未註冊（實測遇到過），每個探測都要等 PowerShell 失敗才落到 `netstat`，重啟因此多花約 1.3 秒——功能不受影響，只是變慢。修法是 `winmgmt /verifyrepository` 或在 Windows 功能中修復 WMI。
 
 ## 運作原理
 
@@ -91,7 +93,9 @@ rm -f ~/.dsh/profiles/web/node_modules/dsh-power
 4. 以 host 半在**還活著時**捕獲的 `process.execPath` + `process.execArgv` + `process.argv` + `process.cwd()` 啟動新行程（不依賴 `PATH`、不從將死行程猜指令；`--inspect` 系列不重播，否則新行程會停在等除錯器）；
 5. 驗證新行程真的在監聽（最多 30 秒），失敗就清理後重試，最多 3 次。
 
-port 由請求的 `Host` header 取得，所以在非預設埠啟動的服務也會重啟在**同一個埠**。新行程一律加上 `--no-open`：`dsh web` 預設會開啟一個瀏覽器分頁，若照原樣重啟，每重啟一次就多一個分頁；而那些分頁各自認證在開啟它的那個行程上，下一次重啟後就會停在「請重新連接」，看起來像服務壞了。使用者手上的頁面本來就會自己重連，不需要再開新分頁。
+埠取自**這個行程自己的 socket**（`webServer.port`），不是請求的 `Host` header，所以在非預設埠啟動的服務會重啟在**同一個埠**；`Host` 只在 server 還沒開始監聽時當後備。這個順序是有理由的：`Host` 是**客戶端要求**的埠，不一定是服務真正所在——經過反向代理或埠轉發時，請求從 `localhost:8080` 進來而服務握著 `3080`，此時若照 `Host` 重啟，worker 會去等一個只有代理持有的埠、把它判定為「非 dsh 佔用者」而拒絕，重啟就永遠不會成功。`--port 0`（由 OS 選埠）也是同一個道理：只有 socket 自己知道實際拿到哪個埠。
+
+實測 argv 不是可靠的埠來源，所以重啟指令會把埠**釘死**在該埠上（既有的 `--port`／`--port=` 就地改寫，沒有就附加），而 web app 的解析器對單值選項取最後一個，因此釘住的值一定生效。新行程一律加上 `--no-open`：`dsh web` 預設會開啟一個瀏覽器分頁，若照原樣重啟，每重啟一次就多一個分頁；而那些分頁各自認證在開啟它的那個行程上，下一次重啟後就會停在「請重新連接」，看起來像服務壞了。使用者手上的頁面本來就會自己重連，不需要再開新分頁。
 
 ## Windows 上的差異
 
@@ -123,7 +127,8 @@ port 由請求的 `Host` header 取得，所以在非預設埠啟動的服務也
 | 滑過 PID 看到的指令列和平常打的不一樣 | POSIX 上那是 `ps` 的原文；讀不到時（沙箱、Windows）改用 host 半自己拼的 `execPath + argv`，PID 一律正確 |
 | 關閉後回不來 | 這是預期行為；請手動啟動服務，或改用「重新啟動」 |
 | 重新啟動後頁面沒回來 | 看 `${DSH_HOME:-~/.dsh}/dsh-web.log`：`dsh-power:` 開頭是 worker 的紀錄，`dsh web: http://…` 是新行程的啟動輸出 |
-| worker 記錄 `aborting: port … is still held` | 該埠被非 dsh 行程佔用（或佔用者查不出來），外掛刻意不殺它；請自行處理佔用者 |
+| worker 記錄 `aborting: port … is still held` | 該埠被非 dsh 行程佔用（或佔用者查不出來），外掛刻意不殺它；請自行處理佔用者。若你是透過反向代理／埠轉發開啟頁面，舊版本會把代理的埠誤認為服務埠而走到這裡；現在的版本以 socket 自己的埠為準，不會再發生 |
+| Windows：`Get-NetTCPConnection` 每次都要等失敗 | 這台機器的 `MSFT_NetTCPConnection` CIM 類別未註冊（`Get-NetTCPConnection` 會回「沒有找到相關的 CIM 類別」）。功能靠 `netstat` 後備照常運作，只是每次探測多約 1.3 秒；修法是 `winmgmt /verifyrepository` 或修復 WMI |
 | Windows：worker 記錄 `refusing pid …: not a dsh process` | 佔用該埠的行程指令列裡沒有 `dsh`／`deepseek-harness`／`@deepseek-ai`，外掛拒絕殺它。若那其實是 DSH（例如自訂啟動腳本），請用「關閉」手動處理 |
 | Windows：重啟後殘留終端機行程 | `ctx.appExit` 那條優雅關閉路徑沒走到（例如 DSH 版本沒有這個服務），只剩下硬殺，ConPTY 終端機不在 Job 內就會留下來；手動結束即可 |
 | Windows：黑窗一閃一閃 | 不該發生——所有探測都帶 `windowsHide`。若真的看到，請回報是哪個指令 |

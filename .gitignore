@@ -2,3 +2,7 @@ node_modules/
 *.log
 *.tgz
 .DS_Store
+# Local Windows verification harness and the reference checkouts it compares
+# against; neither is part of the published package.
+.verify/
+.refs/

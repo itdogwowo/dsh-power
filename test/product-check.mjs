@@ -60,6 +60,9 @@ check('host expands DSH_HOME', hostSource.includes('function dshHomeOf'))
 check('host spawns the worker in its own group', hostSource.includes('set -m'))
 check('host logs acceptance', hostSource.includes("note('host accepted"))
 check('host reads the port from Host', hostSource.includes('function portOf'))
+check('host prefers the port its own socket is listening on', hostSource.includes('ctx.webServer?.port'), )
+check('host pins the relaunch to that port', hostSource.includes('pinnedToPort(withoutBrowserOpen(launch.args), port)'))
+check('host never substitutes a default port for the real one', !/['"]3080['"]/.test(hostSource))
 check('restart never opens a browser tab', hostSource.includes('withoutBrowserOpen'))
 check('host replays node flags', hostSource.includes('process.execArgv'))
 check('host does not replay the inspector', hostSource.includes('DEBUGGER_FLAG'))
@@ -210,23 +213,87 @@ check('node flags are replays except the inspector',
   === '["--max-old-space-size=4096","--import","tsx"]',
   JSON.stringify(host.withoutDebugger(['--inspect-brk', '--max-old-space-size=4096', '--import', 'tsx', '--debug=9229'])))
 
+// The relaunch is pinned to the port the process actually holds. Each shape the
+// captured argv can take is pinned in place, so the relaunch command stays
+// readable and an existing (possibly wrong) value cannot look meaningful.
+check('pin: a missing port is appended',
+  JSON.stringify(host.pinnedToPort(['web', '--no-open'], 3080)) === '["web","--no-open","--port","3080"]',
+  JSON.stringify(host.pinnedToPort(['web', '--no-open'], 3080)))
+check('pin: the documented form is rewritten, not duplicated',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '9999', '--no-open'], 3080)) === '["web","--port","3080","--no-open"]',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '9999', '--no-open'], 3080)))
+check('pin: the `--port=` form is rewritten too',
+  JSON.stringify(host.pinnedToPort(['web', '--port=9999', '--no-open'], 3080)) === '["web","--port=3080","--no-open"]',
+  JSON.stringify(host.pinnedToPort(['web', '--port=9999', '--no-open'], 3080)))
+check('pin: an OS-assigned port replaces the `--port 0` that asked for it',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '0'], 54321)) === '["web","--port","54321"]',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '0'], 54321)))
+check('pin: a repeated flag collapses to one',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '1', '--port', '2'], 3080)) === '["web","--port","3080"]',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '1', '--port', '2'], 3080)))
+check('pin: args are left alone when no bound port is known',
+  JSON.stringify(host.pinnedToPort(['web', '--port', '9999'], undefined)) === '["web","--port","9999"]')
+check('pin: an impossible port is not written into the relaunch',
+  JSON.stringify(host.pinnedToPort(['web'], 0)) === '["web"]' && JSON.stringify(host.pinnedToPort(['web'], 70000)) === '["web"]')
+
 // --- host half: driven through a fake context -----------------------------
 // The Windows branch above is checked statically (no Windows here to run it);
 // everything platform-neutral is exercised for real, including the config the
 // worker receives.
+//
+// SAFETY: this fake context deliberately does NOT provide `appExit`. The host
+// half asks the harness to exit gracefully once the response is out, which on
+// Windows means "the worker kills this process" — and this test suite is very
+// often run from inside the very DSH instance it would then shut down. Leaving
+// appExit out makes the destructive call a no-op, so the suite can never take
+// the user's server with it.
+const IS_WINDOWS_RUN = process.platform === 'win32'
+
+/**
+ * A context `get` that refuses to hand out the app's exit hook.
+ *
+ * Providing one would let this suite terminate the DSH instance running it, so
+ * the refusal is enforced here rather than left to a comment — and it fails the
+ * run loudly if a future change starts depending on it.
+ *
+ * @param extra - names to serve before the guard.
+ * @returns the lookup function.
+ */
+function guardedGet(extra) {
+  return (name) => {
+    if (name === 'appExit') {
+      check('the test context must never expose appExit', false,
+        'the host half asked for appExit; this suite would have shut down its own DSH')
+      return undefined
+    }
+    return Object.prototype.hasOwnProperty.call(extra, name) ? extra[name] : undefined
+  }
+}
 {
   const home = mkdtempSync(join(tmpdir(), 'dsh-power-check-'))
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   const routes = new Map()
+  // SAFETY, part 2 — the load-bearing one. This suite is routinely run from
+  // inside the very DSH instance it is testing, so the action route must never
+  // get past the point where it starts a worker: that is where the host half
+  // asks the harness to exit gracefully, which on Windows means the restart
+  // worker terminating this very process. The spawn therefore captures the
+  // worker spec and then throws, unwinding the route before it can arm anything.
+  const WORKER_REFUSED = new Error('test harness: refusing to start a real restart worker')
   const spawned = []
+  const refusal = (spec) => { spawned.push(spec); throw WORKER_REFUSED }
+  // The real webserver exposes `port`; the plugin must plan the restart around
+  // it rather than around the request's Host header.
+  const BOUND_PORT = 3080
   const fakeCtx = {
     logger: { info: () => {} },
     effect: (fn) => { fn(); return () => {} },
-    get: (name) => (name === 'subprocess'
-      ? { spawn: (spec) => { spawned.push(spec); return { done: Promise.resolve() } } }
-      : undefined),
-    webServer: { register: (route) => { routes.set(route.path, route); return () => {} } },
+    get: guardedGet({ subprocess: { spawn: refusal } }),
+    webServer: {
+      port: BOUND_PORT,
+      register: (route) => { routes.set(route.path, route); return () => {} },
+    },
   }
   try {
     host.apply(fakeCtx)
@@ -264,40 +331,143 @@ check('node flags are replays except the inspector',
     const info = await call('/api/dsh-power/info', 'GET', '127.0.0.1:3080')
     const infoBody = JSON.parse(info.body)
     check('info: reports this process', infoBody.ok === true && infoBody.pid === String(process.pid), JSON.stringify(infoBody))
-    check('info: reports the port from Host', infoBody.port === 3080, String(infoBody.port))
+    check('info: reports the port this process is listening on', infoBody.port === BOUND_PORT, String(infoBody.port))
     check('info: reports a usable command line', typeof infoBody.command === 'string' && infoBody.command.length > 0, infoBody.command)
     check('info: reports the log path', infoBody.logPath === join(home, 'dsh-web.log'), infoBody.logPath)
 
-    const defaultPort = await call('/api/dsh-power/info', 'GET', 'localhost')
-    check('info: a Host without a port reads as the HTTP default', JSON.parse(defaultPort.body).port === 80, defaultPort.body)
+    // The client renders `127.0.0.1:<port>`, so a bound port that disagrees with
+    // the Host header must still be reported as the bound one — the page would
+    // otherwise advertise an address the user cannot open.
+    const viaProxy = await call('/api/dsh-power/info', 'GET', 'localhost:8080')
+    check('info: the listening socket outranks the Host header',
+      JSON.parse(viaProxy.body).port === BOUND_PORT, viaProxy.body)
 
-    const action = await call('/api/dsh-power/action', 'POST', '127.0.0.1:3080', JSON.stringify({ action: 'restart' }))
+    // The action must be planned around the socket too: this request arrives
+    // with a Host header (8080) that is deliberately NOT the port the process
+    // holds, which is exactly the port-forward shape that used to break restarts.
+    //
+    // The route reports 500 here because the harness refuses to start a real
+    // worker (see WORKER_REFUSED). That refusal is the point: it means the whole
+    // config was built and handed over before anything destructive could run.
+    const action = await call('/api/dsh-power/action', 'POST', 'localhost:8080', JSON.stringify({ action: 'restart' }))
     const actionBody = JSON.parse(action.body)
-    check('action: accepted', action.statusCode === 200 && actionBody.ok === true, action.body)
-    check('action: answers with the replaced pid', actionBody.pid === String(process.pid))
+    check('action: the refused spawn is reported as a failure, not a success',
+      action.statusCode === 500 && actionBody.ok === false, action.body)
+    check('action: the failure names the harness refusal',
+      action.body.includes('refusing to start a real restart worker'), action.body)
     check('action: spawned exactly one worker', spawned.length === 1)
     const argv = spawned[0]?.argv ?? []
     check('action: worker runs the shipped script', argv.some((value) => String(value).includes('restart.cjs')))
-    check('action: worker is detached from the group DSH cleans', argv[0] === 'bash' && argv[2].includes('set -m'), argv.slice(0, 2).join(' '))
-    // The payload is the last single-quoted word of the generated shell script.
-    const quoted = [...String(argv[2] ?? '').matchAll(/'([^']*)'/g)].map((match) => match[1])
-    const payload = quoted[quoted.length - 1]
-    const workerConfig = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
-    check('action: worker config names the port and host', workerConfig.port === 3080 && workerConfig.host === '127.0.0.1', JSON.stringify({ port: workerConfig.port, host: workerConfig.host }))
+
+    // The worker's launch shape is platform-specific: a `bash -c 'set -m'` job
+    // group on POSIX, a detached spawn outside the harness's Job Object on
+    // Windows. Only the platform actually running can be driven here, so the
+    // other one is asserted from the source further below.
+    let workerConfig
+    if (IS_WINDOWS_RUN) {
+      check('action: the POSIX shell launcher is not used on Windows',
+        argv[0] !== 'bash', argv.slice(0, 2).map(String).join(' '))
+      // Windows spawns `<node> <restart.cjs> <payload>`, so the config is argv[2]
+      // and must be read straight from the captured spawn call.
+      workerConfig = JSON.parse(Buffer.from(String(argv[2] ?? ''), 'base64url').toString('utf8'))
+    } else {
+      check('action: worker is detached from the group DSH cleans',
+        argv[0] === 'bash' && argv[2].includes('set -m'), argv.slice(0, 2).join(' '))
+      // The payload is the last single-quoted word of the generated shell script.
+      const quoted = [...String(argv[2] ?? '').matchAll(/'([^']*)'/g)].map((match) => match[1])
+      workerConfig = JSON.parse(Buffer.from(quoted[quoted.length - 1], 'base64url').toString('utf8'))
+    }
+    check('action: worker config names the port it will return on, not the proxy port',
+      workerConfig.port === BOUND_PORT, JSON.stringify({ port: workerConfig.port, host: workerConfig.host }))
+    check('action: worker config names the host from the request', workerConfig.host === 'localhost', workerConfig.host)
     check('action: worker config names this pid', workerConfig.pid === String(process.pid))
     check('action: relaunch never opens a browser', workerConfig.args.includes('--no-open'), JSON.stringify(workerConfig.args))
+    // The relaunch must land on the port that was vacated, so the port is pinned
+    // explicitly instead of being inherited from whatever argv happened to say.
+    check('action: relaunch pins the port it was listening on',
+      workerConfig.args[workerConfig.args.length - 1] === String(BOUND_PORT)
+      && workerConfig.args[workerConfig.args.length - 2] === '--port',
+      JSON.stringify(workerConfig.args))
+    check('action: the pinned port appears exactly once',
+      workerConfig.args.filter((value) => value === '--port').length === 1,
+      JSON.stringify(workerConfig.args))
     check('action: relaunch keeps the captured entry point', workerConfig.nodeBin === process.execPath && workerConfig.dshBin === process.argv[1], workerConfig.dshBin)
     check('action: relaunch runs in the captured cwd', workerConfig.cwd === process.cwd(), workerConfig.cwd)
     check('action: the log lives in DSH_HOME', workerConfig.logFile === join(home, 'dsh-web.log'), workerConfig.logFile)
-    check('action: the recorded action is in the log',
-      readFileSync(join(home, 'dsh-web.log'), 'utf8').includes('host accepted restart port=3080'),
-      readFileSync(join(home, 'dsh-web.log'), 'utf8').trim().split('\n').pop())
+    // The acceptance line is written only after a successful spawn, so a refused
+    // spawn must leave the log without one — that ordering is what makes the log
+    // a reliable witness of "did the action ever reach the host".
+    check('action: a refused spawn leaves no acceptance line in the log',
+      !readFileSync(join(home, 'dsh-web.log'), 'utf8').includes('host accepted restart'),
+      readFileSync(join(home, 'dsh-web.log'), 'utf8').trim().split('\n').filter(Boolean).pop() ?? '(log empty)')
 
     const bad = await call('/api/dsh-power/action', 'POST', '127.0.0.1:3080', JSON.stringify({ action: 'explode' }))
     check('action: unknown actions are refused', bad.statusCode === 400, bad.body)
-    const impossiblePort = await call('/api/dsh-power/action', 'POST', '127.0.0.1:99999', JSON.stringify({ action: 'shutdown' }))
-    check('action: an impossible port is refused', impossiblePort.statusCode === 500, impossiblePort.body)
     check('action: no worker was spawned for a refused request', spawned.length === 1)
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+}
+
+// --- host half: without a listening port to read ---------------------------
+// `webServer.port` only exists once the server is listening, so the Host header
+// remains the fallback. That path must still work and must still refuse a port
+// it cannot make sense of.
+{
+  const home = mkdtempSync(join(tmpdir(), 'dsh-power-nohost-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const routes = new Map()
+  const spawned = []
+  const fakeCtx = {
+    logger: { info: () => {} },
+    effect: (fn) => { fn(); return () => {} },
+    get: guardedGet({}),
+    // No `port`: the webserver has not reported one.
+    webServer: { register: (route) => { routes.set(route.path, route); return () => {} } },
+  }
+  try {
+    host.apply(fakeCtx)
+    const call = (path, method, hostHeader, body) => new Promise((resolve) => {
+      const listeners = {}
+      const req = {
+        method,
+        headers: { host: hostHeader },
+        on: (name, handler) => { listeners[name] = handler },
+        destroy: () => {},
+      }
+      // `once` is a no-op here on purpose. The host half attaches its graceful
+      // exit to the response's `finish` event, and on Windows that calls the
+      // harness's own `ctx.appExit` — which, with a real appExit in reach,
+      // would shut down the DSH instance running this test. Nothing on this
+      // path should register a listener at all; this only guarantees that a
+      // regression cannot turn into a self-shutdown.
+      const res = {
+        statusCode: 0,
+        body: '',
+        headers: {},
+        setHeader: (name, value) => { res.headers[name] = value },
+        once: () => {},
+        end: (text) => {
+          res.body = String(text ?? '')
+          resolve(res)
+        },
+      }
+      const settled = Promise.resolve(routes.get(path).handler(req, res))
+      if (body !== undefined) listeners.data?.(body)
+      listeners.end?.()
+      settled.then(() => resolve(res), () => resolve(res))
+    })
+
+    const info = await call('/api/dsh-power/info', 'GET', '127.0.0.1:5123')
+    check('no bound port: the Host header is still used', JSON.parse(info.body).port === 5123, info.body)
+    const defaultPort = await call('/api/dsh-power/info', 'GET', 'localhost')
+    check('no bound port: a Host without a port reads as the HTTP default',
+      JSON.parse(defaultPort.body).port === 80, defaultPort.body)
+    const impossible = await call('/api/dsh-power/action', 'POST', '127.0.0.1:99999', JSON.stringify({ action: 'shutdown' }))
+    check('no bound port: an impossible Host port is refused', impossible.statusCode === 500, impossible.body)
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome
@@ -312,6 +482,9 @@ let loadedUnauth = null
 let reloaded = false
 let replaced = null
 let acted = false
+/** Every readiness probe of `/` made before navigating, and what it answered. */
+const rootProbes = []
+let rootStatus = 200
 const styleTags = []
 const visibilityListeners = []
 const windowListeners = []
@@ -341,7 +514,12 @@ const sandbox = {
   },
   fetch: async (url, options) => {
     calls.push({ url, options })
-    if (url === '/') return { status: 200, json: async () => ({}) }
+    if (url === '/') {
+      // The readiness probe asks for `/` before navigating. Anything except 404
+      // counts as "this origin serves the page".
+      rootProbes.push({ options })
+      return { status: rootStatus, json: async () => ({}) }
+    }
     if (url === '/api/dsh-power/report') return { status: 204, json: async () => ({}) }
     if (url.includes('/info')) {
       const pid = acted ? '55555' : '67489'
@@ -461,6 +639,98 @@ check('no navigation before the new pid answers', replaced === null && reloaded 
 
 await new Promise((resolve) => setTimeout(resolve, 1800))
 check('left for a clean URL after the new pid answered', replaced === 'http://127.0.0.1:3080/', String(replaced))
+// Navigating on the info answer alone used to be enough, and landed on a server
+// that was listening but had no `/` route yet — the browser showed 404 and the
+// user had to refresh. The origin must be asked whether it serves the page.
+check('the origin was asked whether it serves the page before navigating',
+  rootProbes.length >= 1, String(rootProbes.length) + ' probe(s)')
+check('the readiness probe is a plain GET of the app root',
+  rootProbes[0]?.options?.method === 'GET', JSON.stringify(rootProbes[0]?.options))
+
+// --- first-and-a-half scenario: the page is NOT served yet -----------------
+// The exact production shape: the new process answers this plugin's route, but
+// `/` still 404s because the application has not mounted it. The row must wait
+// rather than navigate into the 404.
+{
+  const calls3 = []
+  let loadedNotReady = null
+  let replacedNotReady = null
+  const notReadyProbes = []
+  let infoActed = false
+  let rootProbesDone = 0
+  const sandboxNotReady = {
+    setTimeout,
+    clearTimeout,
+    window: {
+      __ModuleLoader__: { load: (definition) => { loadedNotReady = definition } },
+      location: {
+        origin: 'http://127.0.0.1:3080',
+        href: 'http://127.0.0.1:3080/',
+        reload: () => {},
+        replace: (url) => { replacedNotReady = url },
+      },
+      navigator: { onLine: true },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      document: { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} },
+    },
+    document: {
+      createElement: () => ({ dataset: {}, textContent: '', remove() {} }),
+      head: { appendChild: () => {} },
+    },
+    fetch: async (url) => {
+      calls3.push(url)
+      if (url === '/') {
+        // 404 while the application is still mounting, then fine.
+        rootProbesDone += 1
+        notReadyProbes.push(rootProbesDone)
+        return { status: rootProbesDone < 2 ? 404 : 200, json: async () => ({}) }
+      }
+      if (url === '/api/dsh-power/report') return { status: 204, json: async () => ({}) }
+      if (url.includes('/info')) {
+        return { json: async () => ({ ok: true, pid: infoActed ? '55555' : '67489', port: 3080, command: 'node /x/dsh web' }) }
+      }
+      infoActed = true
+      return { json: async () => ({ ok: true, action: 'restart', pid: '67489', port: 3080, logPath: '/tmp/x.log' }) }
+    },
+    console,
+  }
+  vm.createContext(sandboxNotReady)
+  vm.runInContext(readFileSync(join(root, 'lib/client.js'), 'utf8'), sandboxNotReady, { filename: 'client.js' })
+  const modNotReady = loadedNotReady.factory((id) => {
+    if (id === 'react') return ReactMock
+    throw new Error('unexpected require: ' + id)
+  })
+  const regsNotReady = []
+  modNotReady.apply({
+    get: () => undefined,
+    effect: (fn) => fn(),
+    slots: {
+      inject: (key, callback) => { regsNotReady.key = key; callback() },
+      register: (options, component) => regsNotReady.push({ options, component }),
+    },
+  })
+  Component = regsNotReady[0].component
+  cursor = 0
+  hooks.length = 0
+  effectState.length = 0
+  render()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  buttonWithText('重新啟動').props.onClick()
+  buttonWithText('確認').props.onClick()
+
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  check('not-yet-served: the page did NOT navigate into the 404', replacedNotReady === null, String(replacedNotReady))
+  check('not-yet-served: the row keeps waiting instead of erroring',
+    textOf(root_node).includes('重新連線中…') && !textOf(root_node).includes('請重新整理頁面'),
+    JSON.stringify(textOf(root_node)))
+
+  await new Promise((resolve) => setTimeout(resolve, 2200))
+  check('not-yet-served: it navigated once the page was actually served',
+    replacedNotReady === 'http://127.0.0.1:3080/', String(replacedNotReady))
+  check('not-yet-served: it retried the probe rather than giving up',
+    notReadyProbes.length >= 2, 'probes: ' + notReadyProbes.length)
+}
 
 // --- second scenario: an unauthenticated page -----------------------------
 {
