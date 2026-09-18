@@ -210,6 +210,29 @@ Get-NetTCPConnection : CIM 資源 ROOT/StandardCimv2/MSFT_NetTCPConnection 沒�
 
 `.verify/` 那幾支會在 `$TMPDIR` 下建一個自己的 `DSH_HOME`、用自己的埠（3098／3099 等）、載入同一份外掛，然後測完自己殺掉、自己刪掉。**完全不碰你在跑的 DSH**。這是唯一能安全測試「按重啟」的方法，因為這個外掛的工作就是殺掉它自己所在的行程。
 
+### ⚠️ 跑之前：DSH 在哪由 `.verify/dsh-paths.mjs` 自己找（2026-09-18 改）
+
+`acceptance` / `boot` / `bundle` / `restart` 這四支原本各自**寫死**了某一台
+Windows 機器上 npx 快取的完整路徑。那有兩個後果：
+
+1. 那串路徑**夾帶使用者名稱**——而這個 repo 是公開的。
+2. **在 macOS 上它們會直接找不到 DSH**，也就是說這份交接單原本**沒辦法照著做**。
+
+現在改成由 `.verify/dsh-paths.mjs` 解析：先看環境變數，再依序找 npx 快取
+（Windows 的 `%LOCALAPPDATA%\npm-cache\_npx`、macOS/Linux 的 `~/.npm/_npx`）、
+npm 全域（`%APPDATA%\npm\node_modules`、`/opt/homebrew/lib/node_modules`、
+`/usr/local/lib/node_modules`），找不到就**丟錯並告訴你怎麼給**。
+
+有兩個 DSH 同時存在時，它挑「`bin.js` 最近被改過」的那一個。要指定就用：
+
+```sh
+DSH_BIN=/path/to/node_modules/@deepseek-ai/dsh/lib/bin.js node .verify/boot-check.mjs
+```
+
+> 這一條在 Windows 上實測過：`bundle-check` / `boot-check` / `restart-check` /
+> `acceptance-check` **四支全部 PASSED**，而且都挑到正確的那一包 DSH。
+> macOS 上還沒跑過——那正是這份交接單要你做的事。
+
 ---
 
 ## 6. 完成標準
